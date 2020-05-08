@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "nrf5x-prx",
+    "nrf5x-ptx",
+]
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+debug = true
+lto = true
+codegen-units = 1
