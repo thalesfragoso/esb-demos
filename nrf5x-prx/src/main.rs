@@ -2,7 +2,7 @@
 #![no_main]
 
 // We need to import this crate explicitly so we have a panic handler
-use panic_semihosting as _;
+//use panic_semihosting as _;
 
 /// Configuration macro to be called by the user configuration in `config.rs`.
 ///
@@ -50,14 +50,19 @@ use nrf52832_hal as hal;
 use nrf52840_hal as hal;
 
 use {
-    core::{default::Default, fmt::Write, sync::atomic::AtomicBool},
-    cortex_m_semihosting::hprintln,
+    core::{
+        default::Default,
+        fmt::Write,
+        panic::PanicInfo,
+        sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    },
     embedded_hal::serial::Write as HalWirte,
     esb::{
         consts::*, Addresses, BBBuffer, Config, ConstBBBuffer, Error, EsbApp, EsbBuffer, EsbHeader,
         EsbIrq, IrqTimer,
     },
     hal::{gpio::Level, pac::TIMER0},
+    rtt_target::{rprintln, rtt_init_print},
 };
 
 #[cfg(not(feature = "51"))]
@@ -67,7 +72,7 @@ use hal::{
 };
 
 const MAX_PAYLOAD_SIZE: u8 = 64;
-const MSG: &'static str = "Hello from PRX";
+const RESP: &'static str = "Hello back";
 
 #[rtfm::app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
@@ -106,6 +111,8 @@ const APP: () = {
             .unwrap();
         esb_irq.start_receiving().unwrap();
 
+        rtt_init_print!();
+
         init::LateResources {
             esb_app,
             esb_irq,
@@ -124,7 +131,7 @@ const APP: () = {
             .check()
             .unwrap();
         loop {
-            // Do we received any packet ?
+            // Did we receive any packet ?
             if let Some(packet) = ctx.resources.esb_app.read_packet() {
                 let payload = core::str::from_utf8(&packet[..]).unwrap();
                 //hprintln!("{}", payload).unwrap();
@@ -144,8 +151,8 @@ const APP: () = {
 
                 writeln!(ctx.resources.serial, "--- Sending Hello ---\n").unwrap();
                 let mut response = ctx.resources.esb_app.grant_packet(esb_header).unwrap();
-                let length = MSG.as_bytes().len();
-                &response[..length].copy_from_slice(MSG.as_bytes());
+                let length = RESP.as_bytes().len();
+                &response[..length].copy_from_slice(RESP.as_bytes());
                 response.commit(length);
             }
         }
@@ -156,7 +163,7 @@ const APP: () = {
         match ctx.resources.esb_irq.radio_interrupt() {
             Err(Error::MaximumAttempts) => {}
             Err(e) => panic!("Found error {:?}", e),
-            Ok(state) => {} //hprintln!("{:?}", state).unwrap(),
+            Ok(state) => {} //rprintln!("{:?}", state).unwrap(),
         }
     }
 
@@ -165,3 +172,12 @@ const APP: () = {
         ctx.resources.esb_timer.timer_interrupt();
     }
 };
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    rprintln!("{}", info);
+    loop {
+        compiler_fence(Ordering::SeqCst);
+    }
+}

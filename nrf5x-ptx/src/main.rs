@@ -2,7 +2,7 @@
 #![no_main]
 
 // We need to import this crate explicitly so we have a panic handler
-use panic_semihosting as _;
+//use panic_semihosting as _;
 
 /// Configuration macro to be called by the user configuration in `config.rs`.
 ///
@@ -49,17 +49,19 @@ use {
     core::{
         default::Default,
         fmt::Write,
-        sync::atomic::{AtomicBool, Ordering},
+        panic::PanicInfo,
+        sync::atomic::{compiler_fence, AtomicBool, Ordering},
     },
     esb::{
-        consts::*, Addresses, BBBuffer, Config, ConstBBBuffer, Error, EsbApp, EsbBuffer, EsbHeader,
-        EsbIrq, IrqTimer,
+        consts::*, Addresses, BBBuffer, ConfigBuilder, ConstBBBuffer, Error, EsbApp, EsbBuffer,
+        EsbHeader, EsbIrq, IrqTimer, State,
     },
     hal::{
         gpio::Level,
         pac::{TIMER0, TIMER1, UARTE0},
         uarte::{Baudrate, Parity, Uarte},
     },
+    rtt_target::{rprintln, rtt_init_print},
 };
 
 const MAX_PAYLOAD_SIZE: u8 = 64;
@@ -94,7 +96,10 @@ const APP: () = {
             timer_flag: AtomicBool::new(false),
         };
         let addresses = Addresses::default();
-        let config = Config::default();
+        let config = ConfigBuilder::default()
+            .maximum_transmit_attempts(1)
+            .check()
+            .unwrap();
         let (esb_app, esb_irq, esb_timer) = BUFFER
             .try_split(
                 ctx.device.TIMER0,
@@ -119,6 +124,8 @@ const APP: () = {
         // Clears and starts the counter
         timer.tasks_clear.write(|w| unsafe { w.bits(1) });
         timer.tasks_start.write(|w| unsafe { w.bits(1) });
+
+        rtt_init_print!();
 
         init::LateResources {
             esb_app,
@@ -146,17 +153,13 @@ const APP: () = {
                 pid += 1;
             }
 
-            // Do we received any packet ?
-            if let Some(packet) = ctx.resources.esb_app.read_packet() {
-                ctx.resources.serial.write(b"Payload: ").unwrap();
-                ctx.resources.serial.write(&packet[..]).unwrap();
-                ctx.resources.serial.write(b" rssi: ").unwrap();
-                ctx.resources
-                    .serial
-                    .write(&[packet.get_header().rssi()])
-                    .unwrap();
-                ctx.resources.serial.write(b"\n").unwrap();
-                packet.release();
+            // Did we receive any packet ?
+            if let Some(response) = ctx.resources.esb_app.read_packet() {
+                writeln!(ctx.resources.serial, "Payload: ").unwrap();
+                ctx.resources.serial.write(&response[..]).unwrap();
+                let rssi = response.get_header().rssi();
+                writeln!(ctx.resources.serial, "\nrssi: {}", rssi).unwrap();
+                response.release();
             }
 
             writeln!(ctx.resources.serial, "--- Sending Hello ---\n").unwrap();
@@ -173,7 +176,6 @@ const APP: () = {
                 }
             }
             DELAY_FLAG.store(false, Ordering::Release);
-            //hprintln!("Tick").unwrap();
         }
     }
 
@@ -184,7 +186,7 @@ const APP: () = {
                 ATTEMPTS_FLAG.store(true, Ordering::Release);
             }
             Err(e) => panic!("Found error {:?}", e),
-            _ => {}
+            Ok(state) => {} //rprintln!("{:?}", state),
         }
     }
 
@@ -199,3 +201,12 @@ const APP: () = {
         DELAY_FLAG.store(true, Ordering::Release);
     }
 };
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    rprintln!("{}", info);
+    loop {
+        compiler_fence(Ordering::SeqCst);
+    }
+}
