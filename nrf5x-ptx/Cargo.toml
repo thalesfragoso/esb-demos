@@ -27,7 +27,7 @@ doc = false
 test = false
 
 [features]
-51 = ["esb/52810", "nrf51-hal"]
+51 = ["esb/51", "nrf51-hal"]
 52810 = ["esb/52810", "nrf52810-hal"]
 52832 = ["esb/52832", "nrf52832-hal"]
 52840 = ["esb/52840", "nrf52840-hal"]

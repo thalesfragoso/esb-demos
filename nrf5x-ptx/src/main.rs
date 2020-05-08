@@ -66,6 +66,7 @@ const MAX_PAYLOAD_SIZE: u8 = 64;
 const MSG: &'static str = "Hello from PTX";
 
 static DELAY_FLAG: AtomicBool = AtomicBool::new(false);
+static ATTEMPTS_FLAG: AtomicBool = AtomicBool::new(false);
 
 #[rtfm::app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
@@ -130,14 +131,21 @@ const APP: () = {
 
     #[idle(resources = [serial, esb_app])]
     fn idle(ctx: idle::Context) -> ! {
-        let esb_header = EsbHeader::build()
-            .max_payload(MAX_PAYLOAD_SIZE)
-            .pid(0)
-            .pipe(0)
-            .no_ack(false)
-            .check()
-            .unwrap();
+        let mut pid = 0;
         loop {
+            let esb_header = EsbHeader::build()
+                .max_payload(MAX_PAYLOAD_SIZE)
+                .pid(pid)
+                .pipe(0)
+                .no_ack(false)
+                .check()
+                .unwrap();
+            if pid == 3 {
+                pid = 0;
+            } else {
+                pid += 1;
+            }
+
             // Do we received any packet ?
             if let Some(packet) = ctx.resources.esb_app.read_packet() {
                 ctx.resources.serial.write(b"Payload: ").unwrap();
@@ -158,7 +166,12 @@ const APP: () = {
             packet.commit(length);
             ctx.resources.esb_app.start_tx();
 
-            while !DELAY_FLAG.load(Ordering::Acquire) {}
+            while !DELAY_FLAG.load(Ordering::Acquire) {
+                if ATTEMPTS_FLAG.load(Ordering::Acquire) {
+                    writeln!(ctx.resources.serial, "--- Ack not received ---\n").unwrap();
+                    ATTEMPTS_FLAG.store(false, Ordering::Release);
+                }
+            }
             DELAY_FLAG.store(false, Ordering::Release);
             //hprintln!("Tick").unwrap();
         }
@@ -167,7 +180,9 @@ const APP: () = {
     #[task(binds = RADIO, resources = [esb_irq], priority = 3)]
     fn radio(ctx: radio::Context) {
         match ctx.resources.esb_irq.radio_interrupt() {
-            Err(Error::MaximumAttempts) => {}
+            Err(Error::MaximumAttempts) => {
+                ATTEMPTS_FLAG.store(true, Ordering::Release);
+            }
             Err(e) => panic!("Found error {:?}", e),
             _ => {}
         }

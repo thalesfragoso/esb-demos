@@ -19,14 +19,14 @@ macro_rules! config {
                 let rxd = $p0.$rx_pin.into_floating_input().degrade();
                 let txd = $p0.$tx_pin.into_push_pull_output(Level::Low).degrade();
 
-                let pins = hal::uarte::Pins {
+                let pins = uarte::Pins {
                     rxd,
                     txd,
                     cts: None,
                     rts: None,
                 };
 
-                hal::uarte::Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
+                Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
             }};
         }
     };
@@ -37,7 +37,11 @@ mod config;
 
 // Import the right HAL/PAC crate, depending on the target chip
 #[cfg(feature = "51")]
-use nrf51_hal as hal;
+use nrf51_hal::{
+    self as hal,
+    pac::UART0 as UARTE0,
+    uart::{self as uarte, Baudrate, Parity, Uart as Uarte},
+};
 #[cfg(feature = "52810")]
 use nrf52810_hal as hal;
 #[cfg(feature = "52832")]
@@ -47,15 +51,19 @@ use nrf52840_hal as hal;
 
 use {
     core::{default::Default, fmt::Write, sync::atomic::AtomicBool},
+    cortex_m_semihosting::hprintln,
+    embedded_hal::serial::Write as HalWirte,
     esb::{
         consts::*, Addresses, BBBuffer, Config, ConstBBBuffer, Error, EsbApp, EsbBuffer, EsbHeader,
         EsbIrq, IrqTimer,
     },
-    hal::{
-        gpio::Level,
-        pac::{TIMER0, UARTE0},
-        uarte::{Baudrate, Parity, Uarte},
-    },
+    hal::{gpio::Level, pac::TIMER0},
+};
+
+#[cfg(not(feature = "51"))]
+use hal::{
+    pac::UARTE0,
+    uarte::{self, Baudrate, Parity, Uarte},
 };
 
 const MAX_PAYLOAD_SIZE: u8 = 64;
@@ -74,9 +82,9 @@ const APP: () = {
     fn init(ctx: init::Context) -> init::LateResources {
         let _clocks = hal::clocks::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
 
-        let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
+        let p0 = hal::gpio::p0::Parts::new(ctx.device.GPIO);
 
-        let uart = ctx.device.UARTE0;
+        let uart = ctx.device.UART0;
         let mut serial = apply_config!(p0, uart);
         writeln!(serial, "\n--- INIT ---").unwrap();
 
@@ -118,14 +126,18 @@ const APP: () = {
         loop {
             // Do we received any packet ?
             if let Some(packet) = ctx.resources.esb_app.read_packet() {
-                ctx.resources.serial.write(b"Payload: ").unwrap();
-                ctx.resources.serial.write(&packet[..]).unwrap();
-                ctx.resources.serial.write(b" rssi: ").unwrap();
-                ctx.resources
-                    .serial
-                    .write(&[packet.get_header().rssi()])
-                    .unwrap();
-                ctx.resources.serial.write(b"\n").unwrap();
+                let payload = core::str::from_utf8(&packet[..]).unwrap();
+                //hprintln!("{}", payload).unwrap();
+
+                //ctx.resources.serial.write_str("Payload: ").unwrap();
+                //let payload = core::str::from_utf8(&packet[..]).unwrap();
+                //ctx.resources.serial.write_str(payload).unwrap();
+                //ctx.resources.serial.write_str(" rssi: ").unwrap();
+                //ctx.resources
+                //    .serial
+                //    .write(packet.get_header().rssi())
+                //    .unwrap();
+                //ctx.resources.serial.write(b'\n').unwrap();
                 packet.release();
 
                 // Respond in the next transfer
@@ -136,7 +148,6 @@ const APP: () = {
                 &response[..length].copy_from_slice(MSG.as_bytes());
                 response.commit(length);
             }
-            //hprintln!("Tick").unwrap();
         }
     }
 
@@ -145,7 +156,7 @@ const APP: () = {
         match ctx.resources.esb_irq.radio_interrupt() {
             Err(Error::MaximumAttempts) => {}
             Err(e) => panic!("Found error {:?}", e),
-            _ => {}
+            Ok(state) => {} //hprintln!("{:?}", state).unwrap(),
         }
     }
 
