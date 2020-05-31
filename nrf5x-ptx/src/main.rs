@@ -1,9 +1,6 @@
 #![no_std]
 #![no_main]
 
-// We need to import this crate explicitly so we have a panic handler
-//use panic_semihosting as _;
-
 /// Configuration macro to be called by the user configuration in `config.rs`.
 ///
 /// Expands to yet another `apply_config!` macro that's called from `init` and performs some
@@ -19,14 +16,14 @@ macro_rules! config {
                 let rxd = $p0.$rx_pin.into_floating_input().degrade();
                 let txd = $p0.$tx_pin.into_push_pull_output(Level::Low).degrade();
 
-                let pins = hal::uarte::Pins {
+                let pins = uarte::Pins {
                     rxd,
                     txd,
                     cts: None,
                     rts: None,
                 };
 
-                hal::uarte::Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
+                Uarte::new($uart, pins, Parity::EXCLUDED, Baudrate::$baudrate)
             }};
         }
     };
@@ -53,15 +50,26 @@ use {
         sync::atomic::{compiler_fence, AtomicBool, Ordering},
     },
     esb::{
-        consts::*, Addresses, BBBuffer, ConfigBuilder, ConstBBBuffer, Error, EsbApp, EsbBuffer,
-        EsbHeader, EsbIrq, IrqTimer, State,
+        consts::*, irq::StatePTX, Addresses, BBBuffer, ConfigBuilder, ConstBBBuffer, Error, EsbApp,
+        EsbBuffer, EsbHeader, EsbIrq, IrqTimer,
     },
     hal::{
         gpio::Level,
-        pac::{TIMER0, TIMER1, UARTE0},
-        uarte::{Baudrate, Parity, Uarte},
+        pac::{TIMER0, TIMER1},
     },
     rtt_target::{rprintln, rtt_init_print},
+};
+
+#[cfg(not(feature = "51"))]
+use hal::{
+    pac::UARTE0,
+    uarte::{self, Baudrate, Parity, Uarte},
+};
+
+#[cfg(feature = "51")]
+use hal::{
+    pac::UART0 as UARTE0,
+    uart::{self as uarte, Baudrate, Parity, Uart as Uarte},
 };
 
 const MAX_PAYLOAD_SIZE: u8 = 64;
@@ -73,8 +81,8 @@ static ATTEMPTS_FLAG: AtomicBool = AtomicBool::new(false);
 #[rtfm::app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
-        esb_app: EsbApp<U512, U256>,
-        esb_irq: EsbIrq<U512, U256, TIMER0>,
+        esb_app: EsbApp<U1024, U1024>,
+        esb_irq: EsbIrq<U1024, U1024, TIMER0, StatePTX>,
         esb_timer: IrqTimer<TIMER0>,
         serial: Uarte<UARTE0>,
         delay: TIMER1,
@@ -83,31 +91,36 @@ const APP: () = {
     #[init]
     fn init(ctx: init::Context) -> init::LateResources {
         let _clocks = hal::clocks::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
+        rtt_init_print!();
 
+        #[cfg(not(feature = "51"))]
         let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
 
+        #[cfg(feature = "51")]
+        let p0 = hal::gpio::p0::Parts::new(ctx.device.GPIO);
+
+        #[cfg(not(feature = "51"))]
         let uart = ctx.device.UARTE0;
+
+        #[cfg(feature = "51")]
+        let uart = ctx.device.UART0;
+
         let mut serial = apply_config!(p0, uart);
         writeln!(serial, "\n--- INIT ---").unwrap();
 
-        static BUFFER: EsbBuffer<U512, U256> = EsbBuffer {
+        static BUFFER: EsbBuffer<U1024, U1024> = EsbBuffer {
             app_to_radio_buf: BBBuffer(ConstBBBuffer::new()),
             radio_to_app_buf: BBBuffer(ConstBBBuffer::new()),
             timer_flag: AtomicBool::new(false),
         };
         let addresses = Addresses::default();
         let config = ConfigBuilder::default()
-            .maximum_transmit_attempts(1)
+            .maximum_transmit_attempts(0)
+            .max_payload_size(MAX_PAYLOAD_SIZE)
             .check()
             .unwrap();
         let (esb_app, esb_irq, esb_timer) = BUFFER
-            .try_split(
-                ctx.device.TIMER0,
-                ctx.device.RADIO,
-                addresses,
-                MAX_PAYLOAD_SIZE,
-                config,
-            )
+            .try_split(ctx.device.TIMER0, ctx.device.RADIO, addresses, config)
             .unwrap();
 
         // setup timer for delay
@@ -125,11 +138,9 @@ const APP: () = {
         timer.tasks_clear.write(|w| unsafe { w.bits(1) });
         timer.tasks_start.write(|w| unsafe { w.bits(1) });
 
-        rtt_init_print!();
-
         init::LateResources {
             esb_app,
-            esb_irq,
+            esb_irq: esb_irq.into_ptx(),
             esb_timer,
             serial,
             delay: timer,
@@ -139,6 +150,9 @@ const APP: () = {
     #[idle(resources = [serial, esb_app])]
     fn idle(ctx: idle::Context) -> ! {
         let mut pid = 0;
+        let mut ct_tx: usize = 0;
+        let mut ct_rx: usize = 0;
+        let mut ct_err: usize = 0;
         loop {
             let esb_header = EsbHeader::build()
                 .max_payload(MAX_PAYLOAD_SIZE)
@@ -155,14 +169,25 @@ const APP: () = {
 
             // Did we receive any packet ?
             if let Some(response) = ctx.resources.esb_app.read_packet() {
-                writeln!(ctx.resources.serial, "Payload: ").unwrap();
-                ctx.resources.serial.write(&response[..]).unwrap();
+                ct_rx += 1;
+                write!(ctx.resources.serial, "\rPayload: ").unwrap();
+
+                let text = core::str::from_utf8(&response[..]).unwrap();
+                ctx.resources.serial.write_str(text).unwrap();
+                //ctx.resources.serial.write(&response[..]).unwrap();
                 let rssi = response.get_header().rssi();
-                writeln!(ctx.resources.serial, "\nrssi: {}", rssi).unwrap();
+                write!(ctx.resources.serial, " | rssi: {}", rssi).unwrap();
                 response.release();
             }
 
-            writeln!(ctx.resources.serial, "--- Sending Hello ---\n").unwrap();
+            write!(
+                ctx.resources.serial,
+                " | Sending Hello | tx: {}, rx: {}, err: {}",
+                ct_tx, ct_rx, ct_err
+            )
+            .unwrap();
+
+            ct_tx += 1;
             let mut packet = ctx.resources.esb_app.grant_packet(esb_header).unwrap();
             let length = MSG.as_bytes().len();
             &packet[..length].copy_from_slice(MSG.as_bytes());
@@ -171,8 +196,9 @@ const APP: () = {
 
             while !DELAY_FLAG.load(Ordering::Acquire) {
                 if ATTEMPTS_FLAG.load(Ordering::Acquire) {
-                    writeln!(ctx.resources.serial, "--- Ack not received ---\n").unwrap();
+                    //write!(ctx.resources.serial, "--- Ack not received {}\r", ct_err).unwrap();
                     ATTEMPTS_FLAG.store(false, Ordering::Release);
+                    ct_err += 1;
                 }
             }
             DELAY_FLAG.store(false, Ordering::Release);
@@ -186,7 +212,7 @@ const APP: () = {
                 ATTEMPTS_FLAG.store(true, Ordering::Release);
             }
             Err(e) => panic!("Found error {:?}", e),
-            Ok(state) => {} //rprintln!("{:?}", state),
+            Ok(_) => {} //rprintln!("{:?}", state),
         }
     }
 
@@ -205,6 +231,7 @@ const APP: () = {
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    cortex_m::interrupt::disable();
     rprintln!("{}", info);
     loop {
         compiler_fence(Ordering::SeqCst);

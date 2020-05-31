@@ -1,9 +1,6 @@
 #![no_std]
 #![no_main]
 
-// We need to import this crate explicitly so we have a panic handler
-//use panic_semihosting as _;
-
 /// Configuration macro to be called by the user configuration in `config.rs`.
 ///
 /// Expands to yet another `apply_config!` macro that's called from `init` and performs some
@@ -37,11 +34,7 @@ mod config;
 
 // Import the right HAL/PAC crate, depending on the target chip
 #[cfg(feature = "51")]
-use nrf51_hal::{
-    self as hal,
-    pac::UART0 as UARTE0,
-    uart::{self as uarte, Baudrate, Parity, Uart as Uarte},
-};
+use nrf51_hal as hal;
 #[cfg(feature = "52810")]
 use nrf52810_hal as hal;
 #[cfg(feature = "52832")]
@@ -56,10 +49,9 @@ use {
         panic::PanicInfo,
         sync::atomic::{compiler_fence, AtomicBool, Ordering},
     },
-    embedded_hal::serial::Write as HalWirte,
     esb::{
-        consts::*, Addresses, BBBuffer, Config, ConstBBBuffer, Error, EsbApp, EsbBuffer, EsbHeader,
-        EsbIrq, IrqTimer,
+        consts::*, irq::StatePRX, Addresses, BBBuffer, ConfigBuilder, ConstBBBuffer, Error, EsbApp,
+        EsbBuffer, EsbHeader, EsbIrq, IrqTimer,
     },
     hal::{gpio::Level, pac::TIMER0},
     rtt_target::{rprintln, rtt_init_print},
@@ -71,14 +63,20 @@ use hal::{
     uarte::{self, Baudrate, Parity, Uarte},
 };
 
+#[cfg(feature = "51")]
+use hal::{
+    pac::UART0 as UARTE0,
+    uart::{self as uarte, Baudrate, Parity, Uart as Uarte},
+};
+
 const MAX_PAYLOAD_SIZE: u8 = 64;
 const RESP: &'static str = "Hello back";
 
 #[rtfm::app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
-        esb_app: EsbApp<U512, U256>,
-        esb_irq: EsbIrq<U512, U256, TIMER0>,
+        esb_app: EsbApp<U1024, U1024>,
+        esb_irq: EsbIrq<U1024, U1024, TIMER0, StatePRX>,
         esb_timer: IrqTimer<TIMER0>,
         serial: Uarte<UARTE0>,
     }
@@ -86,32 +84,39 @@ const APP: () = {
     #[init]
     fn init(ctx: init::Context) -> init::LateResources {
         let _clocks = hal::clocks::Clocks::new(ctx.device.CLOCK).enable_ext_hfosc();
+        rtt_init_print!();
 
+        #[cfg(not(feature = "51"))]
+        let p0 = hal::gpio::p0::Parts::new(ctx.device.P0);
+
+        #[cfg(feature = "51")]
         let p0 = hal::gpio::p0::Parts::new(ctx.device.GPIO);
 
+        #[cfg(not(feature = "51"))]
+        let uart = ctx.device.UARTE0;
+
+        #[cfg(feature = "51")]
         let uart = ctx.device.UART0;
+
         let mut serial = apply_config!(p0, uart);
         writeln!(serial, "\n--- INIT ---").unwrap();
 
-        static BUFFER: EsbBuffer<U512, U256> = EsbBuffer {
+        static BUFFER: EsbBuffer<U1024, U1024> = EsbBuffer {
             app_to_radio_buf: BBBuffer(ConstBBBuffer::new()),
             radio_to_app_buf: BBBuffer(ConstBBBuffer::new()),
             timer_flag: AtomicBool::new(false),
         };
         let addresses = Addresses::default();
-        let config = Config::default();
-        let (esb_app, mut esb_irq, esb_timer) = BUFFER
-            .try_split(
-                ctx.device.TIMER0,
-                ctx.device.RADIO,
-                addresses,
-                MAX_PAYLOAD_SIZE,
-                config,
-            )
+        let config = ConfigBuilder::default()
+            .maximum_transmit_attempts(1)
+            .max_payload_size(MAX_PAYLOAD_SIZE)
+            .check()
             .unwrap();
+        let (esb_app, esb_irq, esb_timer) = BUFFER
+            .try_split(ctx.device.TIMER0, ctx.device.RADIO, addresses, config)
+            .unwrap();
+        let mut esb_irq = esb_irq.into_prx();
         esb_irq.start_receiving().unwrap();
-
-        rtt_init_print!();
 
         init::LateResources {
             esb_app,
@@ -133,8 +138,7 @@ const APP: () = {
         loop {
             // Did we receive any packet ?
             if let Some(packet) = ctx.resources.esb_app.read_packet() {
-                let payload = core::str::from_utf8(&packet[..]).unwrap();
-                //hprintln!("{}", payload).unwrap();
+                //let payload = core::str::from_utf8(&packet[..]).unwrap();
 
                 //ctx.resources.serial.write_str("Payload: ").unwrap();
                 //let payload = core::str::from_utf8(&packet[..]).unwrap();
@@ -149,7 +153,6 @@ const APP: () = {
 
                 // Respond in the next transfer
 
-                writeln!(ctx.resources.serial, "--- Sending Hello ---\n").unwrap();
                 let mut response = ctx.resources.esb_app.grant_packet(esb_header).unwrap();
                 let length = RESP.as_bytes().len();
                 &response[..length].copy_from_slice(RESP.as_bytes());
@@ -163,7 +166,7 @@ const APP: () = {
         match ctx.resources.esb_irq.radio_interrupt() {
             Err(Error::MaximumAttempts) => {}
             Err(e) => panic!("Found error {:?}", e),
-            Ok(state) => {} //rprintln!("{:?}", state).unwrap(),
+            Ok(_) => {} //rprintln!("{:?}", state).unwrap(),
         }
     }
 
@@ -176,6 +179,7 @@ const APP: () = {
 #[inline(never)]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    cortex_m::interrupt::disable();
     rprintln!("{}", info);
     loop {
         compiler_fence(Ordering::SeqCst);

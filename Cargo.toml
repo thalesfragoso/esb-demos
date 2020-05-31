@@ -8,7 +8,8 @@ members = [
 opt-level = "s"
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 debug = true
 lto = true
 codegen-units = 1
+debug-assertions = true
