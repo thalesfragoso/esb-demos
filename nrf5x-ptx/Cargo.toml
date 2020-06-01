@@ -7,7 +7,7 @@ authors = [ "Thales Fragoso <thales.fragosoz@gmail.com>"]
 [dependencies]
 cortex-m = "0.6.2"
 cortex-m-rtfm = "0.5.1"
-esb = {path = "../../esb"}
+esb = "0.1.0"
 rtt-target = {version = "0.2.0", features = ["cortex-m"] }
 
 nrf52810-hal = { version = "0.10", features = ["rt"], optional = true }
